@@ -3,6 +3,7 @@ import pandas as pd
 import io
 import re
 import os
+import glob
 
 # Configuración de página
 st.set_page_config(
@@ -12,370 +13,366 @@ st.set_page_config(
 )
 
 st.title("⚙️ Agro Industrial Center (AGC) - Portal de Homologación")
-st.markdown("Herramienta web comercial: Homologa solicitudes de repuestos, calcula intervalos de confianza y genera la plantilla oficial **FR-053 v02**.")
+st.markdown("Herramienta comercial para ventas: Homologa solicitudes de repuestos multiformato y genera el formato oficial **FR-053 v02**.")
 
-# -------------------------------------------------------------
-# 1. Funciones de Carga Robusta y Normalización
-# -------------------------------------------------------------
-def asegurar_columnas_unicas(columnas):
-    """Evita el error de PyArrow 'Duplicate column names found' garantizando unicidad absoluta."""
-    vistas = {}
-    unicas = []
-    for col in columnas:
-        c = str(col).strip()
-        if c in vistas:
-            vistas[c] += 1
-            unicas.append(f"{c}_{vistas[c]}")
+# Función universal de lectura para archivos CSV / Excel
+def leer_archivo_inteligente(origen):
+    if isinstance(origen, str):
+        if not os.path.exists(origen):
+            raise FileNotFoundError(f"No existe: {origen}")
+        with open(origen, "rb") as f:
+            header = f.read(4)
+        if header.startswith(b"PK\x03\x04") or origen.lower().endswith((".xlsx", ".xls")):
+            df = pd.read_excel(origen)
         else:
-            vistas[c] = 0
-            unicas.append(c)
-    return unicas
+            for enc in ["utf-8-sig", "latin1", "cp1252", "utf-8"]:
+                try:
+                    df = pd.read_csv(origen, sep=None, engine="python", encoding=enc)
+                    break
+                except Exception:
+                    continue
+            else:
+                df = pd.read_csv(origen, encoding="latin1")
+    else:
+        # Buffer de Streamlit
+        nombre = getattr(origen, "name", "").lower()
+        contenido = origen.read()
+        origen.seek(0)
+        if contenido.startswith(b"PK\x03\x04") or nombre.endswith((".xlsx", ".xls")):
+            df = pd.read_excel(origen)
+        else:
+            for enc in ["utf-8-sig", "latin1", "cp1252", "utf-8"]:
+                try:
+                    df = pd.read_csv(io.BytesIO(contenido), sep=None, engine="python", encoding=enc)
+                    break
+                except Exception:
+                    continue
+            else:
+                df = pd.read_csv(io.BytesIO(contenido), encoding="latin1")
 
-def normalizar_df(df):
-    """Limpia nombres de columnas y garantiza que sean únicos."""
-    df.columns = [str(c).replace('\ufeff', '').replace('ï»¿', '').strip() for c in df.columns]
-    df.columns = asegurar_columnas_unicas(df.columns)
+    # Limpieza de nombres de columnas
+    df.columns = [str(c).strip().replace("\ufeff", "").replace("ï»¿", "") for c in df.columns]
     return df
 
-def leer_archivo_cualquiera(fuente):
-    """Lee CSV (cualquier separador/codificación) o Excel (.xlsx/.xls)."""
-    # Si es bytes o uploaded file
-    es_excel = False
-    if hasattr(fuente, "name"):
-        if fuente.name.lower().endswith((".xlsx", ".xls")):
-            es_excel = True
-    elif isinstance(fuente, str) and fuente.lower().endswith((".xlsx", ".xls")):
-        es_excel = True
+# Normalizar columnas del catálogo
+def preparar_catalogo(df):
+    col_map = {}
+    for c in df.columns:
+        c_up = c.upper()
+        if "DESCRIP" in c_up or "ITEM" in c_up or "PARTE" in c_up or "CODE" in c_up:
+            if "DESCRIPCION AGC" not in col_map.values():
+                col_map[c] = "DESCRIPCION AGC"
+        elif "SEGMENT" in c_up:
+            col_map[c] = "SEGMENTO"
+        elif "MARCA" in c_up or "BRAND" in c_up:
+            col_map[c] = "MARCA"
+        elif "MODEL" in c_up:
+            col_map[c] = "MODELO"
 
-    if es_excel:
-        df = pd.read_excel(fuente)
-        return normalizar_df(df)
+    df = df.rename(columns=col_map)
+    if "DESCRIPCION AGC" not in df.columns and len(df.columns) > 0:
+        df = df.rename(columns={df.columns[0]: "DESCRIPCION AGC"})
+    for req in ["SEGMENTO", "MARCA", "MODELO"]:
+        if req not in df.columns:
+            df[req] = "AGC"
+    return df
 
-    # Si es CSV, detectar codificación y delimitador
-    if hasattr(fuente, "seek"):
-        fuente.seek(0)
-    
-    delimitadores = [';', ',', '\t']
-    encodings = ['utf-8-sig', 'latin1', 'cp1252', 'utf-8']
-    
-    for enc in encodings:
-        for sep in delimitadores:
-            try:
-                if hasattr(fuente, "seek"):
-                    fuente.seek(0)
-                df = pd.read_csv(fuente, sep=sep, encoding=enc, engine='python')
-                if len(df.columns) > 1 and len(df) > 0:
-                    return normalizar_df(df)
-            except Exception:
-                continue
-
-    # Fallback genérico
-    if hasattr(fuente, "seek"):
-        fuente.seek(0)
-    df = pd.read_csv(fuente, sep=None, engine='python')
-    return normalizar_df(df)
-
-def normalizar_columnas_cliente(df):
-    """Mapea con seguridad las columnas del cliente sin duplicar 'PRODUCTO'."""
-    cols_orig = list(df.columns)
-    mapping = {}
-    asignados = set()
-
-    for c in cols_orig:
-        c_upper = str(c).upper().strip()
-        if any(k in c_upper for k in ["NUMERO DE PARTE", "P/N", "PART NO", "PARTE", "CODIGO"]):
-            if "NUMERO DE PARTE" not in asignados:
-                mapping[c] = "NUMERO DE PARTE"
-                asignados.add("NUMERO DE PARTE")
-                continue
-        if any(k in c_upper for k in ["CANTIDAD", "QTY", "CANT", "SOLICITADA"]):
-            if "CANTIDAD SOLICITADA" not in asignados:
-                mapping[c] = "CANTIDAD SOLICITADA"
-                asignados.add("CANTIDAD SOLICITADA")
-                continue
-        if any(k in c_upper for k in ["MAQUINA", "EQUIPO", "MACHINE"]):
-            if "MAQUINA" not in asignados:
-                mapping[c] = "MAQUINA"
-                asignados.add("MAQUINA")
-                continue
-        if c_upper in ["ITEM", "POS", "POSICION", "NO", "NO.", "#"]:
-            if "ITEM" not in asignados:
-                mapping[c] = "ITEM"
-                asignados.add("ITEM")
-                continue
-        if any(k in c_upper for k in ["PRODUCTO", "DESCRIPCION", "DESCRIPTION", "REPUESTO", "ARTICULO"]):
-            if "PRODUCTO" not in asignados:
-                mapping[c] = "PRODUCTO"
-                asignados.add("PRODUCTO")
-                continue
-        mapping[c] = c
-
-    df_renombrado = df.rename(columns=mapping)
-    df_renombrado.columns = asegurar_columnas_unicas(df_renombrado.columns)
-    return df_renombrado
-
-# -------------------------------------------------------------
-# 2. Carga del Catálogo Maestro AGC
-# -------------------------------------------------------------
+# Cargar catálogo maestro buscando variantes de archivo
 @st.cache_data
-def cargar_catalogo_maestro():
-    posibles_rutas = [
-        "CATALOGO_AGC.csv", "CATALOGO AGC.csv", "catalogo_agc.csv", "catalogo agc.csv",
-        "../CATALOGO_AGC.csv", "/workspace/knowledge/CATALOGO_AGC.csv"
+def buscar_y_cargar_catalogo():
+    rutas_probables = [
+        "CATALOGO_AGC.csv.xlsx",
+        "CATALOGO_AGC.xlsx",
+        "CATALOGO_AGC.csv",
+        "CATALOGO AGC.csv",
+        "CATALOGO AGC.xlsx",
+        "catalogo_agc.xlsx",
+        "catalogo_agc.csv",
+        "catalogo.xlsx",
+        "catalogo.csv"
     ]
-    for ruta in posibles_rutas:
-        if os.path.exists(ruta):
+    # Buscar también en carpeta actual
+    for r in rutas_probables:
+        if os.path.exists(r):
+            df = leer_archivo_inteligente(r)
+            return preparar_catalogo(df), r
+
+    archivos_locales = glob.glob("*CATALOGO*") + glob.glob("*catalogo*") + glob.glob("*.xlsx") + glob.glob("*.csv")
+    for r in archivos_locales:
+        if "CLIENTE" not in r.upper() and "FR053" not in r.upper():
             try:
-                df = leer_archivo_cualquiera(ruta)
-                # Normalizar columnas del catálogo
-                cols_cat = {}
-                for col in df.columns:
-                    cu = col.upper()
-                    if "DESC" in cu: cols_cat[col] = "DESCRIPCION AGC"
-                    elif "SEG" in cu: cols_cat[col] = "SEGMENTO"
-                    elif "MAR" in cu: cols_cat[col] = "MARCA"
-                    elif "MOD" in cu: cols_cat[col] = "MODELO"
-                df = df.rename(columns=cols_cat)
-                if "DESCRIPCION AGC" in df.columns:
-                    return df
+                df = leer_archivo_inteligente(r)
+                if len(df) > 100:  # Es un catálogo maestro
+                    return preparar_catalogo(df), r
             except Exception:
                 continue
-    return None
 
-df_cat = cargar_catalogo_maestro()
+    return None, None
+
+df_cat = None
+nombre_cat = None
+
+try:
+    df_cat, nombre_cat = buscar_y_cargar_catalogo()
+except Exception:
+    df_cat = None
 
 # Barra lateral
 with st.sidebar:
-    st.header("⚙️ Configuración")
+    st.header("⚙️ Configuración y Catálogo")
     if df_cat is not None:
-        st.success(f"Catálogo cargado: {len(df_cat):,} referencias.")
+        st.success(f"✅ Catálogo cargado: {len(df_cat):,} referencias.")
+        st.caption(f"Archivo: `{os.path.basename(nombre_cat)}`")
     else:
-        st.error("⚠️ No se encontró CATALOGO_AGC.csv en la carpeta.")
-        cat_subido = st.file_uploader("Subir Catálogo AGC manualmente (.csv o .xlsx)", type=["csv", "xlsx", "xls"])
+        st.warning("⚠️ No se detectó automáticamente el catálogo en la carpeta.")
+        cat_subido = st.file_uploader("📂 Sube aquí el Catálogo Maestro AGC (.xlsx o .csv):", type=["xlsx", "xls", "csv"])
         if cat_subido is not None:
-            df_cat = leer_archivo_cualquiera(cat_subido)
-            st.success(f"Catálogo cargado: {len(df_cat):,} referencias.")
+            try:
+                df_cat = preparar_catalogo(leer_archivo_inteligente(cat_subido))
+                st.success(f"✅ Catálogo cargado: {len(df_cat):,} referencias.")
+            except Exception as e:
+                st.error(f"Error al leer catálogo: {e}")
 
     st.markdown("---")
-    st.header("👤 Datos de Gestión Comercial")
-    vendedor = st.text_input("Vendedor", value="Ejecutivo Comercial AGC")
+    st.header("👤 Datos Comerciales")
+    vendedor = st.text_input("Vendedor", value="Ejecutivo Comercial")
     cliente = st.text_input("Cliente", placeholder="Ej: Extractora San Fernando")
-    area = st.selectbox("Área de Proceso", ["Extracción / Prensas", "Clarificación", "Palmistería", "Calderas", "Cosecha y Campo"])
-    st.markdown("---")
-    st.caption("Norma: RFQ FR-053 v02")
+    area = st.selectbox("Área de Proceso", ["Extracción / Prensas", "Clarificación", "Palmistería", "Calderas"])
+    st.caption("Formato normativo: RFQ FR-053 v02")
 
-# -------------------------------------------------------------
-# 3. Motor de Homologación Bilingüe e Intervalos de Confianza
-# -------------------------------------------------------------
+# Diccionario técnico bilingüe
+TRADUCCIONES = {
+    r"\btubo\b|\bvara\b|\bpertiga\b": "pole",
+    r"\baluminio\b": "aluminium",
+    r"\bcosecha\b": "harvesting",
+    r"\bcuchilla\b": "knife",
+    r"\bcincel\b": "chisel",
+    r"\bchumacera\b|\bcaja\s+de\s+rodamiento\b": "bearing housing",
+    r"\bsinfin\b|\btornillo\b": "worm screw",
+    r"\bcono\b": "cone",
+    r"\btamiz\b|\bmalla\b": "screen",
+    r"\bseparador\b": "separator",
+    r"\bbomba\b": "pump",
+    r"\bcentrifuga\b": "centrifugal",
+    r"\beje\b": "shaft"
+}
+
+def traducir_espanol_ingles(texto):
+    t = texto.lower()
+    for es_pat, en_word in TRADUCCIONES.items():
+        t = re.sub(es_pat, en_word, t)
+    return t
+
+def extraer_dimensiones(texto):
+    texto = texto.replace(",", ".")
+    dims = set()
+    for m in re.finditer(r"(\d+(?:\.\d+)?)\s*(?:ft|pies|\')", texto, re.IGNORECASE):
+        ft = float(m.group(1))
+        dims.add(f"{round(ft * 0.3048)}m")
+        dims.add(f"{m.group(1)}ft")
+    for m in re.finditer(r"(\d+(?:\.\d+)?)\s*(?:mm|m\b|\")", texto, re.IGNORECASE):
+        dims.add(m.group(1))
+    for m in re.finditer(r"\b(\d{2,4})\b", texto):
+        dims.add(m.group(1))
+    return dims
+
+def normalizar_pn(pn_str):
+    if not pn_str or str(pn_str).lower() in ["nan", "none", "#ref!", "s/n", "sn", "-"]:
+        return ""
+    pn_limpio = str(pn_str).strip()
+    return re.sub(r"\s+", "", pn_limpio)
+
 def homologar_item(row, catalogo):
     pn_raw = str(row.get("NUMERO DE PARTE", "")).strip()
-    maq_raw = str(row.get("MAQUINA", "")).strip()
+    maq_raw = str(row.get("MAQUINA", "")).strip().upper()
     prod_raw = str(row.get("PRODUCTO", "")).strip()
 
-    maq_upper = maq_raw.upper()
-    prod_upper = prod_raw.upper()
+    pn = normalizar_pn(pn_raw)
 
-    pn = pn_raw
-    if pn.lower() in ["nan", "#ref!", "none", "s/n", "-", "0", "null", ""]:
-        pn = ""
-
-    # A) BUSQUEDA POR P/N
     if pn:
-        pn_clean = re.sub(r"\s+", "", pn)
-        variantes = [pn_clean]
-        if "." in pn_clean: variantes.append(pn_clean.replace(".", ","))
-        if "," in pn_clean: variantes.append(pn_clean.replace(",", "."))
-        variantes = list(set(variantes))
+        pn_regex_variantes = [
+            re.escape(pn),
+            re.escape(pn.replace(".", ",")),
+            re.escape(pn.replace(",", "."))
+        ]
+        patron_str = rf"(?:P/N|NO\.?|ITEM|PART)?\s*(?:{'|'.join(set(pn_regex_variantes))})(?:[^0-9A-Z]|$)"
+        patron = re.compile(patron_str, re.IGNORECASE)
 
-        patron_pn = re.compile(rf"(?:P/N|NO\.?|ITEM|PART)?\s*(?:{'|'.join(re.escape(v) for v in variantes)})(?:[^0-9A-Za-z]|$)", re.IGNORECASE)
-        coincidencias = catalogo[catalogo["DESCRIPCION AGC"].astype(str).apply(lambda x: bool(patron_pn.search(x)))]
+        coincidencias = catalogo[catalogo["DESCRIPCION AGC"].astype(str).apply(lambda x: bool(patron.search(x)))]
 
         if len(coincidencias) > 0:
-            # Desambiguación por máquina / marca
-            sub = coincidencias
-            if "KWY" in maq_upper:
-                k = coincidencias[coincidencias["MARCA"].str.contains("KWY", na=False, case=False)]
-                if len(k) > 0: sub = k
-            elif "GS P2" in maq_upper or "GS P2-25" in maq_upper:
-                k = coincidencias[coincidencias["MODELO"].str.contains("GS|P2", na=False, case=False)]
-                if len(k) > 0: sub = k
-            elif "SWECO" in maq_upper or "TAMIZ" in maq_upper:
-                k = coincidencias[coincidencias["MARCA"].str.contains("SWECO", na=False, case=False)]
-                if len(k) > 0: sub = k
-            elif "KEW" in maq_upper or "SEK" in maq_upper:
-                k = coincidencias[coincidencias["MARCA"].str.contains("KEW", na=False, case=False)]
-                if len(k) > 0: sub = k
+            if len(coincidencias) > 1 and maq_raw:
+                if "KWY" in maq_raw:
+                    sub = coincidencias[coincidencias["MARCA"].str.contains("KWY", na=False, case=False)]
+                    if len(sub) > 0: coincidencias = sub
+                elif "GS P2-25" in maq_raw or "GS" in maq_raw:
+                    sub = coincidencias[coincidencias["MODELO"].str.contains("GS|P2", na=False, case=False)]
+                    if len(sub) > 0: coincidencias = sub
+                elif "SWECO" in maq_raw or "TAMIZ" in maq_raw:
+                    sub = coincidencias[coincidencias["MARCA"].str.contains("SWECO", na=False, case=False)]
+                    if len(sub) > 0: coincidencias = sub
+                elif "KEW" in maq_raw or "SEK" in maq_raw:
+                    sub = coincidencias[coincidencias["MARCA"].str.contains("KEWPUMP|KEW", na=False, case=False)]
+                    if len(sub) > 0: coincidencias = sub
 
-            top = sub.iloc[0]
+            top = coincidencias.iloc[0]
             desc = str(top["DESCRIPCION AGC"])
             m_man = re.search(r"\((.*?)\)", desc)
-            desc_man = m_man.group(1) if m_man else desc
+            desc_manual = m_man.group(1) if m_man else desc
 
-            if len(sub) == 1:
-                return desc, top["SEGMENTO"], top["MARCA"], top["MODELO"], desc_man, "🟢 ALTA (100%)", "Coincidencia exacta de P/N y Modelo", "HOMOLOGADO"
+            if len(coincidencias) == 1:
+                return desc, top["SEGMENTO"], top["MARCA"], top["MODELO"], desc_manual, "🟢 ALTA (100%)", "Coincidencia exacta de P/N sin ambigüedad"
             else:
-                return desc, top["SEGMENTO"], top["MARCA"], top["MODELO"], desc_man, "🟡 MEDIA (80%)", f"P/N compartido ({len(sub)} variantes en modelo)", "CONFIRMAR VARIANTE"
+                return desc, top["SEGMENTO"], top["MARCA"], top["MODELO"], desc_manual, "🟡 MEDIA (80%)", f"P/N compartido ({len(coincidencias)} variantes de modelo/medida)"
 
-    # B) BUSQUEDA BILINGÜE Y DIMENSIONAL (Ej. Cosecha, Bombas, Prensas en Español)
-    # 1. Tubos de Aluminio / Varas de Cosecha (Aluminium Harvesting Pole)
-    if any(k in prod_upper for k in ["TUBO", "ALUMINIO", "VARA", "COSECHA", "POLE", "HARVESTING"]):
-        nums = re.findall(r"(\d+(?:[\.,]\d+)?)", prod_raw)
-        sub_poles = catalogo[catalogo["DESCRIPCION AGC"].str.contains("HarvestingPole|AluminiumHarvesting", case=False, na=False)]
-        
-        candidatos = sub_poles
-        # Cotejar cotas (ej: 38mm, 2.2mm, 30ft / 9m / 10m)
-        if "38" in prod_raw:
-            c38 = candidatos[candidatos["DESCRIPCION AGC"].str.contains("38mm", case=False, na=False)]
-            if len(c38) > 0: candidatos = c38
-        if "2.2" in prod_raw or "2,2" in prod_raw:
-            c22 = candidatos[candidatos["DESCRIPCION AGC"].str.contains("2,2mm|2.2mm", case=False, na=False)]
-            if len(c22) > 0: candidatos = c22
-        if "30FT" in prod_upper or "30 FT" in prod_upper or "10M" in prod_upper or "9M" in prod_upper:
-            c10 = candidatos[candidatos["DESCRIPCION AGC"].str.contains("10m|9m", case=False, na=False)]
-            if len(c10) > 0: candidatos = c10
+    # Intento 2: Traducción bilingüe + cotas dimensionales
+    texto_busqueda = f"{prod_raw} {pn_raw}"
+    traducido = traducir_espanol_ingles(texto_busqueda)
+    palabras = [w for w in re.findall(r"[a-zA-Z]{3,}", traducido) if w not in ["para", "con", "del", "los", "the", "and", "c/w"]]
+    dims = extraer_dimensiones(texto_busqueda)
 
-        if len(candidatos) > 0:
-            top = candidatos.iloc[0]
+    if palabras or dims:
+        def puntuar(desc_agc):
+            desc_l = str(desc_agc).lower()
+            pts = 0
+            for p in palabras:
+                if p in desc_l: pts += 2
+            for d in dims:
+                if d.lower() in desc_l: pts += 3
+            return pts
+
+        scores = catalogo["DESCRIPCION AGC"].apply(puntuar)
+        max_score = scores.max()
+        if max_score >= 5:
+            top = catalogo.iloc[scores.argmax()]
             desc = str(top["DESCRIPCION AGC"])
             m_man = re.search(r"\((.*?)\)", desc)
-            desc_man = m_man.group(1) if m_man else desc
-            conf = "🟢 ALTA (95%)" if len(candidatos) <= 3 else "🟡 MEDIA (75%)"
-            return desc, top["SEGMENTO"], top["MARCA"], top["MODELO"], desc_man, conf, "Homologación dimensional bilingüe (Español -> English AGC)", "HOMOLOGADO"
+            desc_manual = m_man.group(1) if m_man else desc
+            conf = "🟢 ALTA (95%)" if max_score >= 8 else "🟠 SUGERIDO (40%)"
+            crit = "Homologación por traducción técnica y medidas" if max_score >= 8 else "Sugerido por similitud de texto"
+            return desc, top["SEGMENTO"], top["MARCA"], top["MODELO"], desc_manual, conf, crit
 
-    # 2. Cuchillas / Cinceles de Cosecha
-    if any(k in prod_upper for k in ["CUCHILLA", "CHISEL", "CINSEL", "M222"]):
-        sub_kn = catalogo[catalogo["DESCRIPCION AGC"].str.contains("KnifeHarvesting|HarvestingChisel", case=False, na=False)]
-        for pat in ["M222A", "M222B", "M222C", "M222-L", "2\"", "3\"", "4\"", "5\""]:
-            if pat in prod_upper:
-                m = sub_kn[sub_kn["DESCRIPCION AGC"].str.contains(pat, case=False, na=False)]
-                if len(m) > 0:
-                    top = m.iloc[0]
-                    desc = str(top["DESCRIPCION AGC"])
-                    return desc, top["SEGMENTO"], top["MARCA"], top["MODELO"], desc, "🟢 ALTA (90%)", "Homologación herramienta de cosecha", "HOMOLOGADO"
+    return "POR HOMOLOGAR EN PLANO", "CPO", "AGC", "ESTÁNDAR", f"{prod_raw} (P/N {pn_raw})", "🔴 REVISIÓN MANUAL (0%)", "Sin P/N o requiere confirmación de plano/medida"
 
-    # C) SUGERENCIA POR PALABRAS CLAVE DEL EQUIPO
-    if maq_upper:
-        tokens = [t for t in re.split(r"[^A-Za-z0-9]", prod_upper) if len(t) >= 4 and t not in ["PARA", "CON", "ESTANDAR", "LARGO", "ACERO"]]
-        if len(tokens) >= 2:
-            query = f"(?=.*{tokens[0]})(?=.*{tokens[1]})"
-            sub_text = catalogo[catalogo["DESCRIPCION AGC"].str.contains(query, regex=True, case=False, na=False)]
-            if len(sub_text) > 0 and len(sub_text) <= 5:
-                top = sub_text.iloc[0]
-                desc = str(top["DESCRIPCION AGC"])
-                return desc, top["SEGMENTO"], top["MARCA"], top["MODELO"], desc, "🟠 SUGERIDO (40%)", "Coincidencia por descripción textual", "SUGERENCIA"
+# Carga de la solicitud del cliente
+st.subheader("📂 Cargar Solicitud de Cotización del Cliente")
+archivo_subido = st.file_uploader("Arrastra aquí el archivo del cliente (.csv o .xlsx):", type=["csv", "xlsx", "xls"])
 
-    # D) POR HOMOLOGAR EN PLANO
-    return (
-        "POR HOMOLOGAR EN PLANO",
-        "CPO",
-        "AGC",
-        "ESTÁNDAR",
-        f"{prod_raw} (P/N: {pn_raw})",
-        "🔴 REVISIÓN MANUAL (0%)",
-        "Sin P/N unívoco o pieza especial (Requiere consultar plano técnico)",
-        "REVISIÓN MANUAL"
-    )
+if archivo_subido is not None:
+    if df_cat is None:
+        st.error("⚠️ Debes cargar primero el Catálogo Maestro AGC en la barra lateral para poder homologar.")
+    else:
+        try:
+            df_raw = leer_archivo_inteligente(archivo_subido)
+            # Renombrar columnas asegurando que sean únicas
+            mapeo = {}
+            col_usadas = set()
 
-# -------------------------------------------------------------
-# 4. Interfaz de Usuario y Procesamiento
-# -------------------------------------------------------------
-archivo_subido = st.file_uploader(
-    "📂 Arrastra la Solicitud del Cliente (CSV o Excel .xlsx / .xls)",
-    type=["csv", "xlsx", "xls"]
-)
+            def asignar(orig, destino):
+                if destino not in col_usadas:
+                    mapeo[orig] = destino
+                    col_usadas.add(destino)
 
-if archivo_subido is not None and df_cat is not None:
-    try:
-        df_cliente = leer_archivo_cualquiera(archivo_subido)
-        df_cliente = normalizar_columnas_cliente(df_cliente)
-    except Exception as e:
-        st.error(f"Error al leer el archivo: {e}")
-        df_cliente = None
+            for c in df_raw.columns:
+                c_clean = str(c).strip().upper()
+                if c_clean == "ITEM":
+                    asignar(c, "ITEM")
+                elif any(k in c_clean for k in ["PARTE", "P/N", "PART", "CODIGO"]):
+                    asignar(c, "NUMERO DE PARTE")
+                elif any(k in c_clean for k in ["CANTIDAD", "QTY", "CANT"]):
+                    asignar(c, "CANTIDAD SOLICITADA")
+                elif any(k in c_clean for k in ["MAQUINA", "EQUIPO", "MACHINE"]):
+                    asignar(c, "MAQUINA")
+                elif any(k in c_clean for k in ["PRODUCTO", "DESCRIP", "REPUESTO", "ITEM"]):
+                    asignar(c, "PRODUCTO")
 
-    if df_cliente is not None:
-        st.subheader(f"📋 Solicitud cargada ({len(df_cliente)} ítems detectados)")
-        st.dataframe(df_cliente.head(4), use_container_width=True)
+            df_cliente = df_raw.rename(columns=mapeo).copy()
 
-        if st.button("🚀 Homologar Lote y Calcular Intervalos de Confianza", type="primary"):
-            with st.spinner("Homologando lote con motor bilingüe y auditoría de confianza..."):
-                filas_salida = []
-                for idx, r in df_cliente.iterrows():
-                    desc, seg, brand, mod, man_desc, conf, crit, stt = homologar_item(r, df_cat)
-                    filas_salida.append({
-                        "ITEM": r.get("ITEM", idx + 1),
-                        "CONFIANZA": conf,
-                        "CRITERIO": crit,
-                        "DESCRIPTION": desc,
-                        "SEGMENT": seg,
-                        "BRAND": brand,
-                        "MODEL": mod,
-                        "U/M": "UN",
-                        "QUANTITY": r.get("CANTIDAD SOLICITADA", 1),
-                        "OBSERVATIONS-DESCRIPCION CLIENTE": f"{r.get('PRODUCTO', '')} | P/N: {r.get('NUMERO DE PARTE', '')} | Máq: {r.get('MAQUINA', '')}",
-                        "DESCRIPCION MANUALES": man_desc,
-                        "ESTADO": stt
-                    })
+            # Garantizar columnas mínimas
+            if "ITEM" not in df_cliente.columns:
+                df_cliente.insert(0, "ITEM", range(1, len(df_cliente) + 1))
+            if "PRODUCTO" not in df_cliente.columns:
+                df_cliente["PRODUCTO"] = ""
+            if "NUMERO DE PARTE" not in df_cliente.columns:
+                df_cliente["NUMERO DE PARTE"] = ""
+            if "CANTIDAD SOLICITADA" not in df_cliente.columns:
+                df_cliente["CANTIDAD SOLICITADA"] = 1
+            if "MAQUINA" not in df_cliente.columns:
+                df_cliente["MAQUINA"] = ""
 
-                df_salida = pd.DataFrame(filas_salida)
-                st.session_state["df_salida"] = df_salida
+            st.markdown(f"**Archivo cargado:** `{archivo_subido.name}` ({len(df_cliente)} ítems detectados)")
+            st.dataframe(df_cliente.head(4), use_container_width=True)
 
-        # Si ya se homologó, mostrar resultados y métricas
-        if "df_salida" in st.session_state:
-            df_res = st.session_state["df_salida"]
+            if st.button("🚀 Homologar Lote y Calcular Confianza Comercial", type="primary"):
+                with st.spinner("Homologando con motor bilingüe y catálogo AGC..."):
+                    filas = []
+                    for idx, r in df_cliente.iterrows():
+                        desc, seg, brand, mod, man_desc, conf, crit = homologar_item(r, df_cat)
+                        filas.append({
+                            "ITEM": r.get("ITEM", idx + 1),
+                            "DESCRIPTION": desc,
+                            "SEGMENT": seg,
+                            "BRAND": brand,
+                            "MODEL": mod,
+                            "U/M": "UN",
+                            "QUANTITY": r.get("CANTIDAD SOLICITADA", 1),
+                            "OBSERVATIONS-DESCRIPCION CLIENTE": f"{r.get('PRODUCTO', '')} | P/N: {r.get('NUMERO DE PARTE', '')} | Máq: {r.get('MAQUINA', '')}",
+                            "DESCRIPCION MANUALES": man_desc,
+                            "CONFIANZA": conf,
+                            "CRITERIO": crit
+                        })
 
-            total_items = len(df_res)
-            alta = len(df_res[df_res["CONFIANZA"].str.contains("ALTA", na=False)])
-            media = len(df_res[df_res["CONFIANZA"].str.contains("MEDIA", na=False)])
-            sug = len(df_res[df_res["CONFIANZA"].str.contains("SUGERIDO", na=False)])
-            revisar = len(df_res[df_res["CONFIANZA"].str.contains("REVISIÓN MANUAL", na=False)])
+                    df_salida = pd.DataFrame(filas)
+                    st.session_state["df_resultado"] = df_salida
 
-            st.markdown("---")
-            st.subheader("📊 Intervalos de Confianza Comercial")
+            if "df_resultado" in st.session_state:
+                res = st.session_state["df_resultado"]
+                st.success(f"✅ ¡Homologación completada! {len(res)} repuestos procesados.")
 
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("🟢 Alta Confianza (90-100%)", f"{alta} ({alta/total_items:.1%})", "Listo para cotizar")
-            c2.metric("🟡 Confianza Media (70-80%)", f"{media} ({media/total_items:.1%})", "Confirmar variante")
-            c3.metric("🟠 Sugeridos (40%)", f"{sug} ({sug/total_items:.1%})", "Revisión sugerida")
-            c4.metric("🔴 Requieren Plano (0%)", f"{revisar} ({revisar/total_items:.1%})", "Verificar en despiece")
+                c_alta = len(res[res["CONFIANZA"].str.contains("ALTA")])
+                c_media = len(res[res["CONFIANZA"].str.contains("MEDIA")])
+                c_sug = len(res[res["CONFIANZA"].str.contains("SUGERIDO")])
+                c_rev = len(res[res["CONFIANZA"].str.contains("MANUAL")])
 
-            # Filtro dinámico
-            filtro = st.radio(
-                "Filtrar vista:",
-                ["Todos los ítems", "🟢 Solo Alta Confianza", "🟡 Solo Media Confianza", "🔴 Solo Requieren Plano"],
-                horizontal=True
-            )
+                k1, k2, k3, k4 = st.columns(4)
+                k1.metric("🟢 Alta Confianza", f"{c_alta} ({round(c_alta/len(res)*100)}%)", "Listos para cotizar")
+                k2.metric("🟡 Media Confianza", f"{c_media} ({round(c_media/len(res)*100)}%)", "Confirmar modelo")
+                k3.metric("🟠 Sugeridos", f"{c_sug} ({round(c_sug/len(res)*100)}%)", "Por texto técnico")
+                k4.metric("🔴 Requiere Plano", f"{c_rev} ({round(c_rev/len(res)*100)}%)", "Revisión manual")
 
-            df_mostrar = df_res
-            if filtro == "🟢 Solo Alta Confianza":
-                df_mostrar = df_res[df_res["CONFIANZA"].str.contains("ALTA", na=False)]
-            elif filtro == "🟡 Solo Media Confianza":
-                df_mostrar = df_res[df_res["CONFIANZA"].str.contains("MEDIA", na=False)]
-            elif filtro == "🔴 Solo Requieren Plano":
-                df_mostrar = df_res[df_res["CONFIANZA"].str.contains("REVISIÓN MANUAL", na=False)]
+                filtro = st.radio("Filtrar visualización:", ["Todos", "🟢 Solo Alta Confianza", "🟡 Solo Media", "🔴 Solo Requieren Plano"], horizontal=True)
+                df_vista = res
+                if filtro == "🟢 Solo Alta Confianza":
+                    df_vista = res[res["CONFIANZA"].str.contains("ALTA")]
+                elif filtro == "🟡 Solo Media":
+                    df_vista = res[res["CONFIANZA"].str.contains("MEDIA")]
+                elif filtro == "🔴 Solo Requieren Plano":
+                    df_vista = res[res["CONFIANZA"].str.contains("MANUAL")]
 
-            st.dataframe(df_mostrar, use_container_width=True)
+                st.dataframe(df_vista, use_container_width=True)
 
-            # Construir el CSV oficial con Encabezado FR-053 e INCLUYENDO Confianza y Criterio
-            encabezado_oficial = (
-                ";;;;;;;;;;;;;;;;;;;;;;;;;;;;;\n"
-                ";REQUEST FOR QUOTATION;;;;;;;\"Código: FR-053\\nVersión:02\\nFecha:11/12/2025\";;;;;;;;;;;;;;;;;;;;;\n"
-                f";CUSTOMER;{cliente};;;CUSTOMER CODE;;DOCUMENT;RFQ-2026-FR053;;;;;;;;;;;;;;;;;;;\n"
-                f";CONTACT;{vendedor};;;#N/D;;;;;;;;;;;;;;;;;;;;;;\n"
-                f";POSITION;Ventas;;;AREA;{area};DATE;25/11/2026;;;;;;;;;;;;;;;;;;;\n"
-                ";EMAIL;;;;#N/D;;;;;;;;;;;;;;;;;;;;;;;;\n"
-                ";PHONE;;;;LINE;INCOTERM;CAMPAING;;;;;;;;;;;;;;;;;;;;;;\n"
-                ";UBICATION;;;;Industrial;EXW;FID;;;;;;;;;;;;;;;;;;;;;;\n"
-                ";;;;;;;;;;;;;;;;;;;;;;;;;;;;;\n"
-            )
+                encabezado_oficial = (
+                    ";;;;;;;;;;;;;;;;;;;;;;;;;;;;;\n"
+                    ";REQUEST FOR QUOTATION;;;;;;;\"Código: FR-053\\nVersión:02\\nFecha:11/12/2025\";;;;;;;;;;;;;;;;;;;;;\n"
+                    f";CUSTOMER;{cliente};;;CUSTOMER CODE;;DOCUMENT;RFQ-2026-FR053;;;;;;;;;;;;;;;;;;;\n"
+                    f";CONTACT;{vendedor};;;#N/D;;;;;;;;;;;;;;;;;;;;;;\n"
+                    f";POSITION;Ventas;;;AREA;{area};DATE;25/11/2026;;;;;;;;;;;;;;;;;;;\n"
+                    ";EMAIL;;;;#N/D;;;;;;;;;;;;;;;;;;;;;;;;\n"
+                    ";PHONE;;;;LINE;INCOTERM;CAMPAING;;;;;;;;;;;;;;;;;;;;;;\n"
+                    ";UBICATION;;;;Industrial;EXW;FID;;;;;;;;;;;;;;;;;;;;;;\n"
+                    ";;;;;;;;;;;;;;;;;;;;;;;;;;;;;\n"
+                )
 
-            buffer_csv = io.StringIO()
-            buffer_csv.write(encabezado_oficial)
-            df_res.to_csv(buffer_csv, sep=";", index=False)
+                buffer_csv = io.StringIO()
+                buffer_csv.write(encabezado_oficial)
+                res.to_csv(buffer_csv, sep=";", index=False)
 
-            st.download_button(
-                label="📥 Descargar RFQ FR-053 Completo (.csv con Intervalo de Confianza)",
-                data=buffer_csv.getvalue().encode("latin1", errors="replace"),
-                file_name=f"RFQ_FR053_{cliente.replace(' ', '_') or 'HOMOLOGADO'}.csv",
-                mime="text/csv",
-                type="primary"
-            )
+                st.download_button(
+                    label="📥 Descargar RFQ FR-053 Completo (.csv con Confianza)",
+                    data=buffer_csv.getvalue().encode("latin1", errors="replace"),
+                    file_name=f"RFQ_FR053_{cliente.replace(' ', '_') or 'HOMOLOGADO'}.csv",
+                    mime="text/csv"
+                )
+
+        except Exception as err:
+            st.error(f"Error al procesar la solicitud: {err}")
